@@ -12,3 +12,5 @@ export const anyTypeIssueAnnotation = new IssueAnnotationData(
 export const nullTypeIssueAnnotation = new IssueAnnotationData(
     "The only value for this in the input is null, which means you probably need a more complete input sample."
 );
+
+export const nullImmutableTypeIssueAnnotation = new IssueAnnotationData("@Nullable");

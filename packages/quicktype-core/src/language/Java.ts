@@ -1,10 +1,14 @@
+import { PrimitiveStringTypeKind, StringTypeMapping, TransformedStringTypeKind } from "..";
 import { anyTypeIssueAnnotation, nullTypeIssueAnnotation } from "../Annotation";
 import { ConvenienceRenderer, ForbiddenWordsInfo } from "../ConvenienceRenderer";
-import { DependencyName, funPrefixNamer, Name, Namer } from "../Naming";
+import { DependencyName, Name, Namer, funPrefixNamer } from "../Naming";
 import { RenderContext } from "../Renderer";
-import { BooleanOption, EnumOption, getOptionValues, Option, OptionValues, StringOption } from "../RendererOptions";
-import { maybeAnnotated, Sourcelike } from "../Source";
-import { acronymOption, acronymStyle, AcronymStyleOptions } from "../support/Acronyms";
+import { BooleanOption, EnumOption, Option, OptionValues, StringOption, getOptionValues } from "../RendererOptions";
+import { Sourcelike, maybeAnnotated } from "../Source";
+import { TargetLanguage } from "../TargetLanguage";
+import { ArrayType, ClassProperty, ClassType, EnumType, MapType, Type, TypeKind, UnionType } from "../Type";
+import { directlyReachableSingleNamedType, matchType, nullableFromUnion, removeNullFromUnion } from "../TypeUtils";
+import { AcronymStyleOptions, acronymOption, acronymStyle } from "../support/Acronyms";
 import {
     allLowerWordStyle,
     allUpperWordStyle,
@@ -21,10 +25,6 @@ import {
     utf16LegalizeCharacters
 } from "../support/Strings";
 import { assert, assertNever, defined, panic } from "../support/Support";
-import { TargetLanguage } from "../TargetLanguage";
-import { ArrayType, ClassProperty, ClassType, EnumType, MapType, Type, TypeKind, UnionType } from "../Type";
-import { directlyReachableSingleNamedType, matchType, nullableFromUnion, removeNullFromUnion } from "../TypeUtils";
-import { StringTypeMapping, TransformedStringTypeKind, PrimitiveStringTypeKind } from "..";
 
 export const javaOptions = {
     useList: new EnumOption(
@@ -50,6 +50,9 @@ export const javaOptions = {
     // FIXME: Do this via a configurable named eventually.
     packageName: new StringOption("package", "Generated package name", "NAME", "io.quicktype"),
     lombok: new BooleanOption("lombok", "Use lombok", false, "primary"),
+    immutables: new BooleanOption("immutables", "Use immutables", false, "primary"),
+    immutablesGsonSerialize: new BooleanOption("immutables-gson-serialize", "Gson Serialize", false, "secondary"),
+    immutablesBuilder: new BooleanOption("immutables-builder", "add the builder method", false, "secondary"),
     lombokCopyAnnotations: new BooleanOption("lombok-copy-annotations", "Copy accessor annotations", true, "secondary")
 };
 
@@ -66,7 +69,10 @@ export class JavaTargetLanguage extends TargetLanguage {
             javaOptions.acronymStyle,
             javaOptions.packageName,
             javaOptions.lombok,
-            javaOptions.lombokCopyAnnotations
+            javaOptions.lombokCopyAnnotations,
+            javaOptions.immutables,
+            javaOptions.immutablesGsonSerialize,
+            javaOptions.immutablesBuilder
         ];
     }
 
@@ -625,7 +631,12 @@ export class JavaRenderer extends ConvenienceRenderer {
         return matchType<Sourcelike>(
             t,
             _anyType => maybeAnnotated(withIssues, anyTypeIssueAnnotation, "Object"),
-            _nullType => maybeAnnotated(withIssues, nullTypeIssueAnnotation, "Object"),
+            _nullType => {
+                if (this._options.immutables) {
+                    this.emitLine("@Nullable");
+                }
+                return maybeAnnotated(withIssues, nullTypeIssueAnnotation, "Object");
+            },
             _boolType => (reference ? "Boolean" : "boolean"),
             _integerType => (reference ? "Long" : "long"),
             _doubleType => (reference ? "Double" : "double"),
@@ -727,6 +738,12 @@ export class JavaRenderer extends ConvenienceRenderer {
         if (this._options.lombok) {
             this.emitLine("@lombok.Data");
         }
+        if (this._options.immutables) {
+            this.emitLine("@Value.Immutable");
+            if (this._options.immutablesGsonSerialize) {
+                this.emitLine("@Gson.TypeAdapters");
+            }
+        }
     }
 
     protected annotationsForAccessor(
@@ -775,10 +792,20 @@ export class JavaRenderer extends ConvenienceRenderer {
     protected emitClassDefinition(c: ClassType, className: Name): void {
         let imports = [...this.importsForType(c), ...this.importsForClass(c)];
 
+        if (this._options.immutables) {
+            imports.push(
+                "com.google.gson.annotations.SerializedName",
+                "org.immutables.gson.Gson",
+                "org.immutables.value.Value",
+                "org.jetbrains.annotations.Nullable"
+            );
+        }
+
         this.emitFileHeader(className, imports);
         this.emitDescription(this.descriptionForType(c));
         this.emitClassAttributes(c, className);
-        this.emitBlock(["public class ", className], () => {
+        const classType = this._options.immutables ? "public interface " : "public class";
+        this.emitBlock([classType, className], () => {
             this.forEachClassProperty(c, "none", (name, jsonName, p) => {
                 if (this._options.lombok && this._options.lombokCopyAnnotations) {
                     const getter = this.annotationsForAccessor(c, className, name, jsonName, p, false);
@@ -789,10 +816,28 @@ export class JavaRenderer extends ConvenienceRenderer {
                     if (setter.length !== 0) {
                         this.emitLine("@lombok.Setter(onMethod_ = {" + setter.join(", ") + "})");
                     }
+                } else if (this._options.immutables) {
+                    // do nothing
+                } else {
+                    this.emitLine("private ", this.javaType(false, p.type, true), " ", name, ";");
                 }
-                this.emitLine("private ", this.javaType(false, p.type, true), " ", name, ";");
             });
-            if (!this._options.lombok) {
+            if (this._options.immutables) {
+                if (this._options.immutablesBuilder) {
+                    // TODO
+                    this.emitBlock(["static Immutable", className, ".Builder builder() "], () => {
+                        this.emitLine("return Immutable", className, ".builder()");
+                    });
+                }
+
+                this.forEachClassProperty(c, "leading-and-interposing", (name, jsonName, p) => {
+                    this.emitDescription(this.descriptionForClassProperty(c, jsonName));
+                    const [getterName, _] = defined(this._gettersAndSettersForPropertyName.get(name));
+                    const rendered = this.javaType(false, p.type);
+                    this.emitLine(rendered, " ", getterName, "();");
+                });
+            }
+            if (!this._options.lombok && !this._options.immutables) {
                 this.forEachClassProperty(c, "leading-and-interposing", (name, jsonName, p) => {
                     this.emitDescription(this.descriptionForClassProperty(c, jsonName));
                     const [getterName, setterName] = defined(this._gettersAndSettersForPropertyName.get(name));
